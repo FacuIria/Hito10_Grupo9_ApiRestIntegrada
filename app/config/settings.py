@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     timeout_seconds: float = Field(default=5, ge=1, le=30)
+    loki_url: str = ""  # opcional: si se define, los logs JSON tambien se envian a Loki
     cursor_secret: SecretStr = Field(default_factory=lambda: SecretStr(secrets.token_hex(32)))
     mongo_uri: SecretStr = SecretStr("mongodb://localhost:27017")
     mongo_database: str = "fixture2030"

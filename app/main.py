@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 import logging
 from pathlib import Path
@@ -9,15 +10,19 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, FileResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 
 from app.config.settings import Settings
 from app.errors import ApiError
-from app.metrics import HTTP_LATENCY
-from app.observability import emit, request_id
+from app.metrics import DEPENDENCY_UP, HTTP_LATENCY, MONGO_OPERATIONS, MONGO_SERVER_CONNECTIONS
+from app.observability import configure_loki, emit, request_id
 from app.routes.api import router
 from app.schemas.models import ErrorResponse
 from app.services.fixture import FixtureService
+
+
+METRICS_CHECK_TIMEOUT = 3
 
 
 def build_adapters(settings):
@@ -34,6 +39,7 @@ def build_adapters(settings):
 
 def create_app(settings=None, adapters=None):
     settings = settings or Settings()
+    configure_loki(settings.loki_url)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -106,7 +112,23 @@ def create_app(settings=None, adapters=None):
         return FileResponse(frontend / "index.html")
 
     @app.get("/metrics", include_in_schema=False)
-    def metrics():
+    async def metrics(request: Request):
+        # Ping real a las seis bases, en paralelo y con tope de 3 s: Prometheus corta a los 5 s.
+        svc = request.app.state.service
+        sources = list(svc.adapters)
+        tasks = {source: asyncio.ensure_future(run_in_threadpool(svc.check, source)) for source in sources}
+        mongo_status = asyncio.ensure_future(run_in_threadpool(svc.adapters["mongodb"].server_status))
+        await asyncio.wait([*tasks.values(), mongo_status], timeout=METRICS_CHECK_TIMEOUT)
+        try:
+            status = mongo_status.result()
+            MONGO_SERVER_CONNECTIONS.set(float(status["conexiones"]))
+            for kind, value in status["operaciones"].items():
+                MONGO_OPERATIONS.labels(kind).set(float(value))
+        except Exception:
+            pass  # MongoDB no respondio a tiempo: se conservan los ultimos valores
+        for source, task in tasks.items():
+            ok = task.done() and not task.exception() and task.result()["estado"] == "ok"
+            DEPENDENCY_UP.labels(source).set(1 if ok else 0)
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/health/live", tags=["Operacion"], summary="Verificar el proceso HTTP")

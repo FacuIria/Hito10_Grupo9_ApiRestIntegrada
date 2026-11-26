@@ -178,3 +178,48 @@ def test_create_session_invalid_never_writes(client, adapters, body):
 def test_create_session_unavailable_is_503(client, adapters):
     adapters["redis"].create_session.side_effect = unavailable("redis")
     assert client.post("/api/v1/sesiones", json={"usuario_id": "USR2"}).status_code == 503
+
+
+def test_metrics_report_each_dependency_up_or_down(client, adapters):
+    adapters["redis"].ping.side_effect = unavailable("redis")
+    body = client.get("/metrics").text
+    for source in ["mongodb", "neo4j", "cassandra", "influxdb", "iris"]:
+        assert f'fixture2030_dependencia_disponible{{dependencia="{source}"}} 1.0' in body
+    assert 'fixture2030_dependencia_disponible{dependencia="redis"} 0.0' in body
+
+
+def test_loki_shipper_never_blocks_when_loki_is_down():
+    from app.observability import LokiShipper
+    shipper = LokiShipper("http://127.0.0.1:1")
+    for i in range(20000):
+        shipper.put(f'{{"n": {i}}}')
+    assert shipper.lines.qsize() <= 10000
+
+
+def test_guarded_records_latency_in_flight_and_failures():
+    from app.observability import guarded
+
+    class Fake:
+        @guarded("redis", ValueError)
+        def ok(self):
+            return 1
+
+        @guarded("redis", ValueError)
+        def broken(self):
+            raise ValueError("x")
+
+    Fake().ok()
+    with pytest.raises(Exception):
+        Fake().broken()
+    from prometheus_client import generate_latest
+    body = generate_latest().decode()
+    assert 'fixture2030_dependencia_duracion_segundos_count{dependencia="redis",operacion="ok",resultado="ok"}' in body
+    assert 'fixture2030_dependencia_duracion_segundos_count{dependencia="redis",operacion="broken",resultado="dependency_error"}' in body
+    assert 'fixture2030_dependencia_en_curso{dependencia="redis"} 0.0' in body
+
+
+def test_metrics_publish_mongodb_server_status(client, adapters):
+    adapters["mongodb"].server_status.return_value = {"conexiones": 7, "operaciones": {"query": 42, "insert": 3}}
+    body = client.get("/metrics").text
+    assert "fixture2030_mongodb_conexiones_servidor 7.0" in body
+    assert 'fixture2030_mongodb_operaciones_acumuladas{tipo="query"} 42.0' in body
